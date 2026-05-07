@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fridge Inventory — SmartFridge</title>
+    <meta name="description" content="Smart fridge inventory tracker with expiry date monitoring">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+
+<body>
+    <header class="header">
+        <div class="header-inner">
+            <div class="logo">
+                <span class="logo-icon">🧊</span>
+                <h1>SmartFridge</h1>
+            </div>
+            <div class="header-actions">
+                <button id="btn-refresh" class="btn btn-ghost" title="Refresh">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                        stroke-linecap="round" stroke-linejoin="round">
+                        <polyline points="23 4 23 10 17 10" />
+                        <polyline points="1 20 1 14 7 14" />
+                        <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
+                    </svg>
+                </button>
+                <button id="btn-capture" class="btn btn-capture" title="Capture with Pi Camera">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                        stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z" />
+                        <circle cx="12" cy="13" r="4" />
+                    </svg>
+                    Capture
+                </button>
+                <button id="btn-add" class="btn btn-primary">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
+                        stroke-linecap="round" stroke-linejoin="round">
+                        <line x1="12" y1="5" x2="12" y2="19" />
+                        <line x1="5" y1="12" x2="19" y2="12" />
+                    </svg>
+                    Add Item
+                </button>
+                <div id="camera-status" style="align-self:center;color:var(--text-dim);font-size:.9rem;margin-left:8px">
+                    Camera: …</div>
+                <button id="btn-simulate" class="btn btn-ghost" title="Toggle simulated capture"
+                    style="margin-left:6px">Simulate: Off</button>
+            </div>
+        </div>
+    </header>
+
+    <main class="dashboard-shell">
+        <section class="dashboard-left">
+            <div class="preview-section">
+                <div class="preview-card">
+                    <div class="preview-card-header">
+                        <div>
+                            <p class="preview-kicker">Live Camera</p>
+                            <h2>Always-on preview</h2>
+                            <p class="preview-copy">Watch the feed here while you position items for capture.</p>
+                        </div>
+                        <span id="preview-status" class="preview-badge">Connecting…</span>
+                    </div>
+                    <div class="preview-frame">
+                        <img id="live-preview-image" src="/api/capture/stream" alt="Live camera preview">
+                    </div>
+                </div>
+            </div>
+
+            <section class="log-section">
+                <div class="log-card">
+                    <div class="log-card-header">
+                        <div>
+                            <p class="preview-kicker">Capture Log</p>
+                            <h2>Terminal-style activity</h2>
+                        </div>
+                        <button class="btn btn-ghost btn-sm" id="btn-clear-log">Clear</button>
+                    </div>
+                    <pre id="capture-log" class="capture-log" aria-live="polite"></pre>
+                </div>
+            </section>
+        </section>
+
+        <section class="dashboard-right">
+            <section class="stats-bar">
+                <div class="stat-card">
+                    <div class="stat-icon stat-icon-total"><svg width="22" height="22" viewBox="0 0 24 24" fill="none"
+                            stroke="currentColor" stroke-width="2">
+                            <path
+                                d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" />
+                        </svg></div>
+                    <div class="stat-info"><span class="stat-value" id="val-total">0</span><span
+                            class="stat-label">Total
+                            Items</span></div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon stat-icon-fresh"><svg width="22" height="22" viewBox="0 0 24 24" fill="none"
+                            stroke="currentColor" stroke-width="2">
+                            <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
+                            <polyline points="22 4 12 14.01 9 11.01" />
+                        </svg></div>
+                    <div class="stat-info"><span class="stat-value" id="val-fresh">0</span><span
+                            class="stat-label">Fresh</span>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon stat-icon-warning"><svg width="22" height="22" viewBox="0 0 24 24" fill="none"
+                            stroke="currentColor" stroke-width="2">
+                            <path
+                                d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+                            <line x1="12" y1="9" x2="12" y2="13" />
+                            <line x1="12" y1="17" x2="12.01" y2="17" />
+                        </svg></div>
+                    <div class="stat-info"><span class="stat-value" id="val-warning">0</span><span
+                            class="stat-label">Expiring
+                            Soon</span></div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon stat-icon-expired"><svg width="22" height="22" viewBox="0 0 24 24" fill="none"
+                            stroke="currentColor" stroke-width="2">
+                            <circle cx="12" cy="12" r="10" />
+                            <line x1="15" y1="9" x2="9" y2="15" />
+                            <line x1="9" y1="9" x2="15" y2="15" />
+                        </svg></div>
+                    <div class="stat-info"><span class="stat-value" id="val-expired">0</span><span
+                            class="stat-label">Expired</span></div>
+                </div>
+            </section>
+
+            <section class="filter-bar">
+                <div class="filter-tabs">
+                    <button class="filter-tab active" data-filter="all">All</button>
+                    <button class="filter-tab" data-filter="fresh">Fresh</button>
+                    <button class="filter-tab" data-filter="warning">Expiring Soon</button>
+                    <button class="filter-tab" data-filter="expired">Expired</button>
+                </div>
+            </section>
+
+            <section class="inventory-panel">
+                <div class="inventory-panel-header">
+                    <div>
+                        <p class="preview-kicker">Inventory</p>
+                        <h2>Tracked items</h2>
+                    </div>
+                    <button class="btn btn-ghost btn-sm" onclick="openAddModal()">Add item</button>
+                </div>
+                <main class="items-grid" id="items-grid"></main>
+                <div class="empty-state" id="empty-state" style="display:none">
+                    <div class="empty-icon">🧊</div>
+                    <h2>Your fridge is empty</h2>
+                    <p>Items will appear here when the camera captures them,<br>or you can add them manually.</p>
+                    <button class="btn btn-primary" onclick="openAddModal()">Add First Item</button>
+                </div>
+            </section>
+        </section>
+    </main>
+
+    <div class="modal-overlay" id="modal-overlay">
+        <div class="modal" id="item-modal">
+            <div class="modal-header">
+                <h2 id="modal-title">Add Item</h2>
+                <button class="btn btn-ghost modal-close" id="btn-modal-close"><svg width="20" height="20"
+                        viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="18" y1="6" x2="6" y2="18" />
+                        <line x1="6" y1="6" x2="18" y2="18" />
+                    </svg></button>
+            </div>
+            <form id="item-form" class="modal-form">
+                <input type="hidden" id="form-id">
+                <div class="form-group">
+                    <label for="form-name">Item Name</label>
+                    <input type="text" id="form-name" placeholder="e.g. Milk, Yogurt, Cheese..." autocomplete="off">
+                </div>
+                <div class="form-group">
+                    <label for="form-image">Image Filename</label>
+                    <input type="text" id="form-image" placeholder="e.g. IMG_001.jpg" required autocomplete="off">
+                    <span class="form-hint">Filename of the image in the uploads/ folder</span>
+                </div>
+                <div class="form-group">
+                    <label for="form-expiry">Expiry Date</label>
+                    <input type="date" id="form-expiry" required>
+                </div>
+                <div class="modal-actions">
+                    <button type="button" class="btn btn-ghost" id="btn-cancel">Cancel</button>
+                    <button type="submit" class="btn btn-primary" id="btn-submit">Add Item</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <div class="modal-overlay" id="delete-overlay">
+        <div class="modal modal-sm">
+            <div class="modal-header">
+                <h2>Delete Item</h2>
+            </div>
+            <p class="delete-msg">Are you sure you want to delete <strong id="delete-item-name"></strong>? This cannot
+                be undone.</p>
+            <div class="modal-actions">
+                <button class="btn btn-ghost" id="btn-delete-cancel">Cancel</button>
+                <button class="btn btn-danger" id="btn-delete-confirm">Delete</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="toast" id="toast"></div>
+    <script src="/static/app.js"></script>
+</body>
+
+</html>

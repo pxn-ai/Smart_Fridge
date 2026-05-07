@@ -1,0 +1,18 @@
+Flask>=3.0
+
+# Camera project requirements
+picamera2>=0.3.8
+# Note: OpenCV and NumPy are optional and often require platform-native wheels.
+# If you need preview/advanced image processing, install opencv-python and a
+# NumPy version compatible with your platform separately.
+Pillow>=10.0.0
+
+# OCR
+pytesseract>=0.3.10
+
+# Date parsing
+python-dateutil>=2.8.0
+
+# Optional / helpers
+requests>=2.31.0
+python-dotenv>=1.0.0
