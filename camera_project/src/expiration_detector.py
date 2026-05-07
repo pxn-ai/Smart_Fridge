@@ -206,7 +206,7 @@ def _main():
 
     try:
         import config.config as cam_config
-        from ocr_engine import OCREngine
+        from camera_project.backup.ocr_engine import OCREngine
     except Exception as exc:
         print(f"Failed to import OCR dependencies: {exc}")
         return 1

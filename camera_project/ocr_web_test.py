@@ -37,7 +37,7 @@ if str(SRC_DIR) not in sys.path:
 try:
     import config.config as cam_config
     from src.camera_capture import CameraCapture
-    from src.ocr_engine import OCREngine
+    from camera_project.backup.ocr_engine import OCREngine
     from src.expiration_detector import ExpirationDetector
     PIPELINE_AVAILABLE = True
 except Exception as exc:
