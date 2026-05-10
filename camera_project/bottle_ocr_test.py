@@ -15,6 +15,12 @@ import os
 import re
 import pytesseract
 from typing import List, Tuple
+from pathlib import Path
+
+try:
+    from ultralytics import YOLO
+except ImportError:
+    YOLO = None
 
 # ── Configuration ─────────────────────────────────────────────
 CAMERA_WIDTH  = 1920
@@ -28,6 +34,9 @@ MIN_TEXT_LEN = 3
 BURST_COUNT = 6
 BURST_INTERVAL_SEC = 0.20
 ROTATION_CANDIDATES = (0, 180)  # Keep lightweight for Pi
+DATE_DETECTOR_MODEL = os.path.join(os.path.dirname(__file__), "models", "date_region_yolo.pt")
+DATE_DETECTOR_CONF = 0.30
+DATE_DETECTOR_PADDING = 0.08
 # Central ROI where bottle labels usually appear.
 ROI_X0 = 0.18
 ROI_X1 = 0.82
@@ -96,6 +105,45 @@ def extract_label_roi(frame: np.ndarray) -> Tuple[np.ndarray, tuple]:
     y0, y1 = int(h * ROI_Y0), int(h * ROI_Y1)
     roi = frame[y0:y1, x0:x1]
     return roi, (x0, y0)
+
+
+def detect_date_region_with_yolo(frame: np.ndarray) -> Tuple[np.ndarray, tuple, str]:
+    """
+    Detect date-print region using a YOLO model.
+    Falls back to central ROI when model is unavailable or no detection.
+    """
+    fallback_roi, fallback_offset = extract_label_roi(frame)
+
+    model_path = Path(DATE_DETECTOR_MODEL)
+    if YOLO is None or not model_path.exists():
+        return fallback_roi, fallback_offset, "fallback: central ROI (no YOLO model)"
+
+    try:
+        model = YOLO(str(model_path))
+        preds = model.predict(frame, conf=DATE_DETECTOR_CONF, verbose=False)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        return fallback_roi, fallback_offset, f"fallback: YOLO error ({exc})"
+
+    if not preds or len(preds[0].boxes) == 0:
+        return fallback_roi, fallback_offset, "fallback: central ROI (no date box detected)"
+
+    boxes = preds[0].boxes.xyxy.cpu().numpy()
+    confs = preds[0].boxes.conf.cpu().numpy()
+    best_idx = int(np.argmax(confs))
+    x1, y1, x2, y2 = boxes[best_idx]
+
+    h, w = frame.shape[:2]
+    pad_x = int((x2 - x1) * DATE_DETECTOR_PADDING)
+    pad_y = int((y2 - y1) * DATE_DETECTOR_PADDING)
+    x1 = max(0, int(x1) - pad_x)
+    y1 = max(0, int(y1) - pad_y)
+    x2 = min(w, int(x2) + pad_x)
+    y2 = min(h, int(y2) + pad_y)
+
+    roi = frame[y1:y2, x1:x2]
+    if roi.size == 0:
+        return fallback_roi, fallback_offset, "fallback: empty YOLO crop"
+    return roi, (x1, y1), f"YOLO date ROI (conf={confs[best_idx]:.2f})"
 
 
 def capture_best_burst_frame(cam) -> np.ndarray:
@@ -204,6 +252,33 @@ def is_date_like_token(text: str) -> bool:
         r"\b\d{4}[\/\-.]\d{1,2}[\/\-.]\d{1,2}\b",
     )
     return any(re.search(p, t) for p in patterns)
+
+
+def extract_mfd_exp_dates(text: str) -> dict:
+    """
+    Extract MFD/EXP dates from noisy OCR text.
+    Supports separators '.', '/', '-' and optional spaces.
+    """
+    compact = " ".join(text.split())
+    out = {"mfd": None, "exp": None}
+
+    date_pat = r"(\d{4}[\/\-.]\d{1,2}[\/\-.]\d{1,2}|\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4})"
+    mfd_pat = re.compile(
+        rf"(mfd|mfg|mfty)\b.{{0,24}}?{date_pat}",
+        re.IGNORECASE,
+    )
+    exp_pat = re.compile(
+        rf"(exp|bb|best\s*before|use\s*by)\b.{{0,24}}?{date_pat}",
+        re.IGNORECASE,
+    )
+
+    mfd_match = mfd_pat.search(compact)
+    exp_match = exp_pat.search(compact)
+    if mfd_match:
+        out["mfd"] = mfd_match.group(2)
+    if exp_match:
+        out["exp"] = exp_match.group(2)
+    return out
 
 
 def run_ocr(image: np.ndarray, x_offset: int = 0, y_offset: int = 0) -> list:
@@ -383,7 +458,8 @@ def main():
     print(f"  Raw frame saved  → {raw_path}")
 
     # ── 4. Preprocess ────────────────────────────────────────
-    roi, (x0, y0) = extract_label_roi(frame)
+    roi, (x0, y0), roi_source = detect_date_region_with_yolo(frame)
+    print(f"ROI source: {roi_source}")
     print("Preprocessing ROI (blur check → sharpen → CLAHE → denoise + variants)...")
     processed = preprocess(roi)
 
@@ -414,6 +490,11 @@ def main():
         preview_variant if preview_variant is not None else processed,
         config='--psm 6'
     ).strip()
+    dates = extract_mfd_exp_dates(full_text)
+    print("\n── Extracted key dates ──")
+    print(f"MFD: {dates['mfd'] or '(not found)'}")
+    print(f"EXP: {dates['exp'] or '(not found)'}")
+
     print("\n── Full OCR text (unfiltered) ──")
     print(full_text if full_text else "(empty)")
     print("── End ──\n")
