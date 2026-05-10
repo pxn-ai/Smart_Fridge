@@ -47,8 +47,8 @@ UPSCALE_FACTOR   = 2      # Applied in strategies A and raw
 UPSCALE_FACTOR_B = 3      # Strategy B: adaptive threshold needs more detail
 UPSCALE_FACTOR_C = 3      # Strategy C uses a harder upscale for faded labels
 PSM_MODES        = [4, 6, 11, 3]  # column, block, sparse, fully-auto
-ADAPTIVE_BLUR_RADIUS = 20  # BoxBlur radius for adaptive thresholding at 3x
-ADAPTIVE_C = 10            # Adaptive threshold offset constant
+ADAPTIVE_BLUR_RADIUS = 25  # BoxBlur radius for adaptive thresholding at 3x (tuned)
+ADAPTIVE_C = 12            # Adaptive threshold offset constant (tuned)
 DATE_REGEX = re.compile(
     r"\b(?:\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4}|\d{4}[\/\-.]\d{1,2}[\/\-.]\d{1,2})\b"
 )
@@ -121,10 +121,11 @@ class OCREngine:
             )
             return {
                 "full_text": result["text"],
-                "confidence": result["raw_conf"],
-                "words": result["words"],
+                "confidence": float(result.get("mean_conf", 0.0)),
+                "words": result.get("words", []),
                 "status": "success",
                 "_meta": result.get("_meta", {}),
+                "word_confs": result.get("word_confs", []),
             }
 
         except Exception as exc:
@@ -498,14 +499,37 @@ class OCREngine:
     def _run_tesseract_with_config(self, img, cfg):
         """Run Tesseract with an explicit config string."""
         lang = self.config.OCR_LANGUAGE
-
         text = pytesseract.image_to_string(img, lang=lang, config=cfg)
         data = pytesseract.image_to_data(
             img, lang=lang, config=cfg, output_type="dict"
         )
-        confs = [c for c in data.get("conf", []) if isinstance(c, (int, float)) and c >= 0]
+
+        # Normalize confidence values which can be strings like '-1' or numeric
+        raw_confs = data.get("conf", []) or []
+        confs = []
+        for c in raw_confs:
+            try:
+                # Some tesseract builds return strings; convert to float
+                val = float(c)
+            except Exception:
+                continue
+            if val >= 0:
+                confs.append(val)
+
         mean_conf = statistics.mean(confs) if confs else 0.0
+
         words = [w for w in data.get("text", []) if w and w.strip()]
+
+        # word-level confidences (align with words list) — useful to score date tokens
+        word_confs = []
+        for w, c in zip(data.get("text", []), raw_confs):
+            if not w or not w.strip():
+                continue
+            try:
+                word_conf = float(c)
+            except Exception:
+                word_conf = -1.0
+            word_confs.append({"word": w.strip(), "conf": word_conf})
 
         # Extract PSM from config string for metadata
         psm_match = re.search(r"--psm\s+(\d+)", cfg)
@@ -513,8 +537,9 @@ class OCREngine:
 
         return {
             "text": text,
-            "raw_conf": data.get("conf", []),
+            "raw_conf": raw_confs,
             "words": words,
+            "word_confs": word_confs,
             "mean_conf": mean_conf,
             "psm": psm_val,
         }
@@ -576,10 +601,22 @@ class OCREngine:
                 result["text"] = result["text"].strip()
                 if not result["text"]:
                     continue
-
                 score = result["mean_conf"]
+
+                # Determine best date-token confidence in the returned words
+                date_token_conf = 0.0
+                for wc in result.get("word_confs", []):
+                    if re.search(r"\d{6,}", wc.get("word", "")) or re.search(r"\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4}", wc.get("word", "")):
+                        try:
+                            date_token_conf = max(date_token_conf, float(wc.get("conf", 0.0)))
+                        except Exception:
+                            pass
+
+                # Boost score strongly for date-like text; allow low-mean_conf if token-level conf exists
                 if self._contains_date_like_text(result["text"]):
                     score += 50.0
+                if date_token_conf > 0:
+                    score += min(max(date_token_conf, 10.0), 60.0)
                 if blur_score < BLUR_THRESHOLD:
                     score += 5.0
                 result["score"] = score
@@ -619,8 +656,20 @@ class OCREngine:
 
                     # Score: mean confidence + bonus for date-like text
                     score = result["mean_conf"]
+                    # if we have word-level confidences, find highest date-token confidence
+                    date_token_conf = 0.0
+                    for wc in result.get("word_confs", []):
+                        if re.search(r"\d{6,}", wc["word"]):
+                            date_token_conf = max(date_token_conf, float(wc.get("conf", 0.0)))
+                        if re.search(r"\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4}", wc["word"]):
+                            date_token_conf = max(date_token_conf, float(wc.get("conf", 0.0)))
+
                     if self._contains_date_like_text(text):
-                        score += 30.0  # Strongly prefer results with dates
+                        # Strongly prefer results with dates
+                        score += 30.0
+                        # If a date-like token exists with even low confidence, boost to allow low-mean detections
+                        if date_token_conf > 0:
+                            score += min(max(date_token_conf, 15.0), 40.0)
                     # Bonus for having substantial text (not just noise)
                     word_count = len([w for w in result["words"] if len(w) >= 2])
                     score += min(word_count * 2.0, 20.0)

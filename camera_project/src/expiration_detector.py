@@ -42,6 +42,9 @@ class ExpirationDetector:
         r'\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{2,4}',
     ]
 
+    # Match concatenated 8-digit dates like 22012027 or 23012026
+    DATE_CONCAT_PATTERN = re.compile(r"\b(\d{8})\b")
+
     def __init__(self, config=None):
         self.config = config
 
@@ -89,6 +92,27 @@ class ExpirationDetector:
             for match in matches:
                 dates.append(match.group(0))
 
+        # Also consider concatenated digit runs that look like ddmmyyyy or yyyymmdd
+        for m in re.finditer(self.DATE_CONCAT_PATTERN, text):
+            digits = m.group(1)
+            # Try ddmmyyyy
+            dd, mm, yyyy = digits[:2], digits[2:4], digits[4:]
+            try:
+                dd_i, mm_i, yyyy_i = int(dd), int(mm), int(yyyy)
+                if 1 <= dd_i <= 31 and 1 <= mm_i <= 12 and 2000 <= yyyy_i <= 2099:
+                    dates.append(f"{dd}/{mm}/{yyyy}")
+                    continue
+            except Exception:
+                pass
+            # Try yyyymmdd
+            yyyy2, mm2, dd2 = digits[:4], digits[4:6], digits[6:]
+            try:
+                yyyy_i, mm_i, dd_i = int(yyyy2), int(mm2), int(dd2)
+                if 2000 <= yyyy_i <= 2099 and 1 <= mm_i <= 12 and 1 <= dd_i <= 31:
+                    dates.append(f"{yyyy2}-{mm2}-{dd2}")
+            except Exception:
+                pass
+
         return list(set(dates))  # Remove duplicates
 
     def parse_date(self, date_string):
@@ -134,6 +158,7 @@ class ExpirationDetector:
 
             # Extract all dates
             dates = self.extract_dates(text)
+            concat_matches = self.DATE_CONCAT_PATTERN.findall(text)
 
             # Parse and validate dates
             now = datetime.now()
@@ -151,6 +176,7 @@ class ExpirationDetector:
                             'parsed': parsed.isoformat(),
                             'formatted': parsed.strftime('%Y-%m-%d'),
                             'is_future': parsed > now,
+                            'from_concat': bool(re.match(r"^\d{1,2}/\d{1,2}/\d{4}$", date_str) and concat_matches),
                         })
 
             results['detected_dates'] = parsed_dates
@@ -169,7 +195,11 @@ class ExpirationDetector:
                     parsed_dates,
                     key=lambda x: x['parsed']
                 )
-                results['confidence'] = 0.5  # Lower confidence for past dates
+                # If the date came from a concatenated digit run, be more permissive
+                if any(d.get('from_concat') for d in parsed_dates):
+                    results['confidence'] = 0.6
+                else:
+                    results['confidence'] = 0.5  # Lower confidence for past dates
 
             logger.info(f"Detected expiration dates: {parsed_dates}")
             return results
