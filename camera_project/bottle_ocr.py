@@ -21,24 +21,59 @@ CONFIDENCE_MIN  = 0.6        # ignore detections below this score
 # ──────────────────────────────────────────────────────────────
 
 
+def blur_score(gray: np.ndarray) -> float:
+    """
+    Laplacian variance — higher = sharper.
+    Rough guide: <30 very blurry, 30-80 soft, >80 acceptable.
+    """
+    return cv2.Laplacian(gray, cv2.CV_64F).var()
+
+
+def sharpen(gray: np.ndarray, strength: float = 1.5) -> np.ndarray:
+    """
+    Unsharp mask — the standard fix for close-up/macro softness.
+    Subtracts a blurred version of itself to amplify edges.
+    strength: 0.8 = subtle, 1.5 = moderate, 2.5 = aggressive.
+    """
+    blurred = cv2.GaussianBlur(gray, (0, 0), sigmaX=2)
+    return cv2.addWeighted(gray, 1 + strength, blurred, -strength, 0)
+
+
 def preprocess(frame: np.ndarray) -> np.ndarray:
     """
-    Improve OCR accuracy for glossy bottle labels:
-      1. Convert to grayscale
-      2. CLAHE — boosts local contrast (helps with curved/shiny labels)
-      3. Mild denoise
-      4. Adaptive threshold → back to BGR for PaddleOCR
+    Improve OCR accuracy for close-up, glossy bottle labels:
+      1. Grayscale
+      2. Blur detection — reports score so you can judge distance/focus
+      3. Unsharp mask sharpening — strength scales with how blurry it is
+      4. CLAHE — local contrast boost for curved/shiny surfaces
+      5. Denoise
+      6. Adaptive threshold -> BGR for PaddleOCR
     """
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-    # Contrast Limited Adaptive Histogram Equalization
+    # ── Blur detection & report ───────────────────────────────
+    score = blur_score(gray)
+    if score < 30:
+        print(f"  WARNING: Very blurry (score: {score:.1f}) — try moving slightly further back.")
+    elif score < 80:
+        print(f"  NOTE: Soft image (score: {score:.1f}) — sharpening applied.")
+    else:
+        print(f"  OK: Sharpness good (score: {score:.1f})")
+
+    # ── Unsharp mask sharpening ───────────────────────────────
+    # Blurrier images get stronger sharpening, up to a sensible ceiling.
+    # Formula: low score -> high strength, capped between 0.8 and 2.5.
+    strength = max(0.8, min(2.5, 120.0 / (score + 1)))
+    gray = sharpen(gray, strength=strength)
+
+    # ── CLAHE ─────────────────────────────────────────────────
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     gray = clahe.apply(gray)
 
-    # Remove noise while preserving edges
+    # ── Denoise ───────────────────────────────────────────────
     gray = cv2.fastNlMeansDenoising(gray, h=10)
 
-    # Adaptive threshold — handles uneven lighting on curved surfaces
+    # ── Adaptive threshold ────────────────────────────────────
     thresh = cv2.adaptiveThreshold(
         gray, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
@@ -47,7 +82,6 @@ def preprocess(frame: np.ndarray) -> np.ndarray:
         C=2
     )
 
-    # PaddleOCR expects a BGR image
     return cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
 
 
@@ -99,9 +133,9 @@ def draw_results(frame: np.ndarray, results) -> np.ndarray:
 
 def print_results(results) -> None:
     """Print detected text to terminal."""
-    print("\n" + "═" * 50)
+    print("\n" + "=" * 50)
     print("  DETECTED TEXT")
-    print("═" * 50)
+    print("=" * 50)
 
     filtered = [(t, c) for _, t, c in parse_results(results) if c >= CONFIDENCE_MIN]
 
@@ -111,13 +145,13 @@ def print_results(results) -> None:
         for text, confidence in filtered:
             print(f"  {text:<35} ({confidence:.0%})")
 
-    print("═" * 50 + "\n")
+    print("=" * 50 + "\n")
 
 
 def main():
     print("Initialising PaddleOCR (first run downloads models ~60MB)...")
     ocr = PaddleOCR(
-        use_textline_orientation=True,  # replaces deprecated use_angle_cls
+        use_textline_orientation=True,
         lang='en',
         show_log=False,
     )
@@ -134,21 +168,18 @@ def main():
     print("Camera ready.\n")
 
     print("Controls:")
-    print(f"  [C]  — Capture frame and run OCR")
-    print(f"  [Q]  — Quit\n")
+    print("  [C]  -- Capture frame and run OCR")
+    print("  [Q]  -- Quit\n")
 
     last_overlay = None
 
     while True:
-        # Grab live frame
         frame = cam.capture_array()
-        display = cv2.resize(frame, (PREVIEW_WIDTH, PREVIEW_HEIGHT))
 
-        # Show last OCR result overlaid on preview
         if last_overlay is not None:
             show = cv2.resize(last_overlay, (PREVIEW_WIDTH, PREVIEW_HEIGHT))
         else:
-            show = display.copy()
+            show = cv2.resize(frame, (PREVIEW_WIDTH, PREVIEW_HEIGHT))
             cv2.putText(show, "Press C to scan", (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 220, 255), 2)
 
