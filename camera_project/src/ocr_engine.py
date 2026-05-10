@@ -14,6 +14,7 @@ Improvements over v1:
 import logging
 import os
 import statistics
+from pathlib import Path
 
 try:
     import pytesseract
@@ -29,6 +30,12 @@ try:
 except ImportError:
     NUMPY_AVAILABLE = False
 
+try:
+    from ultralytics import YOLO
+    YOLO_AVAILABLE = True
+except ImportError:
+    YOLO_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 # ── Tuning knobs ──────────────────────────────────────────────────────────────
@@ -43,8 +50,11 @@ class OCREngine:
 
     def __init__(self, config):
         self.config = config
+        self._date_detector = None
+        self._date_detector_status = "disabled"
         if OCR_AVAILABLE and hasattr(config, "TESSERACT_PATH"):
             pytesseract.pytesseract.pytesseract_cmd = config.TESSERACT_PATH
+        self._init_date_detector()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -73,7 +83,8 @@ class OCREngine:
             return {"status": "error", "error": str(exc)}
 
         try:
-            gray = image.convert("L")
+            ocr_input, roi_meta = self._detect_date_roi(image)
+            gray = ocr_input.convert("L")
             blur_score = self._blur_score(gray)
             is_blurry = blur_score < BLUR_THRESHOLD
             if is_blurry:
@@ -107,12 +118,86 @@ class OCREngine:
                     "psm": best["psm"],
                     "mean_conf": best["mean_conf"],
                     "blur_score": blur_score,
+                    "roi": roi_meta,
                 },
             }
 
         except Exception as exc:
             logger.error("Error extracting text from %s: %s", image_path, exc)
             return {"status": "error", "error": str(exc)}
+
+    def _init_date_detector(self):
+        """Load optional YOLO model used to crop date-print region."""
+        model_path = getattr(self.config, "YOLO_DATE_MODEL_PATH", "")
+        if not model_path:
+            self._date_detector_status = "disabled:no-model-path"
+            return
+        if not YOLO_AVAILABLE:
+            self._date_detector_status = "disabled:ultralytics-not-installed"
+            return
+
+        path = Path(model_path)
+        if not path.exists():
+            self._date_detector_status = f"disabled:model-not-found:{path}"
+            return
+        try:
+            self._date_detector = YOLO(str(path))
+            self._date_detector_status = f"enabled:{path.name}"
+            logger.info("YOLO date detector loaded: %s", path)
+        except Exception as exc:
+            self._date_detector = None
+            self._date_detector_status = f"disabled:model-load-error:{exc}"
+            logger.warning("Failed to load YOLO date detector: %s", exc)
+
+    def _detect_date_roi(self, image):
+        """
+        Return ROI image focused on date region if YOLO is available.
+        Falls back to original image when no reliable detection exists.
+        """
+        fallback_meta = {
+            "source": "full_image",
+            "detector": self._date_detector_status,
+            "box": None,
+        }
+        if self._date_detector is None or not NUMPY_AVAILABLE:
+            return image, fallback_meta
+
+        try:
+            arr = np.array(image.convert("RGB"))
+            conf_th = float(getattr(self.config, "YOLO_DATE_DETECT_CONFIDENCE", 0.30))
+            preds = self._date_detector.predict(arr, conf=conf_th, verbose=False)
+            if not preds or len(preds[0].boxes) == 0:
+                return image, fallback_meta
+
+            boxes = preds[0].boxes.xyxy.cpu().numpy()
+            confs = preds[0].boxes.conf.cpu().numpy()
+            best_idx = int(np.argmax(confs))
+            x1, y1, x2, y2 = boxes[best_idx]
+
+            pad_ratio = float(getattr(self.config, "YOLO_DATE_DETECT_PADDING", 0.08))
+            width = max(1.0, x2 - x1)
+            height = max(1.0, y2 - y1)
+            px = int(width * pad_ratio)
+            py = int(height * pad_ratio)
+            img_w, img_h = image.size
+            x1 = max(0, int(x1) - px)
+            y1 = max(0, int(y1) - py)
+            x2 = min(img_w, int(x2) + px)
+            y2 = min(img_h, int(y2) + py)
+            if x2 <= x1 or y2 <= y1:
+                return image, fallback_meta
+
+            crop = image.crop((x1, y1, x2, y2))
+            meta = {
+                "source": "yolo_date_region",
+                "detector": self._date_detector_status,
+                "box": [x1, y1, x2, y2],
+                "confidence": float(confs[best_idx]),
+            }
+            return crop, meta
+        except Exception as exc:
+            logger.debug("YOLO ROI detection failed: %s", exc)
+            return image, fallback_meta
 
     def extract_regions(self, image_path, regions=None):
         """

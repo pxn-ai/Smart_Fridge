@@ -19,6 +19,9 @@ class ExpirationDetector:
     """Detects expiration dates in text"""
 
     EXPIRY_KEYWORDS = [
+        r'mfd',
+        r'mfg',
+        r'mfty',
         r'best\s+by',
         r'use\s+by',
         r'best\s+before',
@@ -32,7 +35,9 @@ class ExpirationDetector:
     DATE_PATTERNS = [
         r'\d{1,2}/\d{1,2}/\d{2,4}',
         r'\d{1,2}-\d{1,2}-\d{2,4}',
+        r'\d{1,2}\.\d{1,2}\.\d{2,4}',
         r'\d{4}-\d{1,2}-\d{1,2}',
+        r'\d{4}\.\d{1,2}\.\d{1,2}',
         r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s*\d{2,4}',
         r'\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{2,4}',
     ]

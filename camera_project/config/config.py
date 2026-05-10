@@ -31,6 +31,9 @@ IMAGE_THRESHOLD = 50  # For motion/change detection (0-255)
 # OCR settings
 OCR_LANGUAGE = 'eng'  # Tesseract language code
 TESSERACT_PATH = '/usr/bin/tesseract'  # Path to tesseract binary
+YOLO_DATE_MODEL_PATH = os.path.join(BASE_DIR, 'models', 'yolov26n.pt')
+YOLO_DATE_DETECT_CONFIDENCE = 0.30
+YOLO_DATE_DETECT_PADDING = 0.08
 
 # GPIO / Button settings (set USE_GPIO=False for keyboard mode)
 USE_GPIO = False
