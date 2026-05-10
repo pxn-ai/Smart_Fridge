@@ -7,8 +7,10 @@ Raspberry Pi 5 + Camera Module V2 + PaddleOCR
 import cv2
 import numpy as np
 import time
+import platform
 from picamera2 import Picamera2
 from paddleocr import PaddleOCR
+import pytesseract
 
 # ── Configuration ─────────────────────────────────────────────
 CAMERA_WIDTH    = 1920
@@ -18,7 +20,20 @@ PREVIEW_HEIGHT  = 540
 CAPTURE_KEY     = ord('c')   # press C to capture & scan
 QUIT_KEY        = ord('q')   # press Q to quit
 CONFIDENCE_MIN  = 0.6        # ignore detections below this score
+BLUR_WARN_SCORE = 30.0
+BLUR_SOFT_SCORE = 80.0
+MAX_SHARPEN_STRENGTH = 2.5
+MIN_SHARPEN_STRENGTH = 0.8
+SHARPEN_FACTOR = 120.0
+CAMERA_WARMUP_SEC = 1.5
+SAVE_DEBUG_IMAGES = False
+OCR_ENGINE = "auto"          # "auto", "paddle", "tesseract"
+TESSERACT_PSM = 11
+ROTATE_180 = True            # IMX219 often reports 180-degree orientation
 # ──────────────────────────────────────────────────────────────
+
+# Reuse CLAHE object to avoid rebuilding on every scan.
+CLAHE = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
 
 def blur_score(gray: np.ndarray) -> float:
@@ -53,9 +68,9 @@ def preprocess(frame: np.ndarray) -> np.ndarray:
 
     # ── Blur detection & report ───────────────────────────────
     score = blur_score(gray)
-    if score < 30:
+    if score < BLUR_WARN_SCORE:
         print(f"  WARNING: Very blurry (score: {score:.1f}) — try moving slightly further back.")
-    elif score < 80:
+    elif score < BLUR_SOFT_SCORE:
         print(f"  NOTE: Soft image (score: {score:.1f}) — sharpening applied.")
     else:
         print(f"  OK: Sharpness good (score: {score:.1f})")
@@ -63,12 +78,11 @@ def preprocess(frame: np.ndarray) -> np.ndarray:
     # ── Unsharp mask sharpening ───────────────────────────────
     # Blurrier images get stronger sharpening, up to a sensible ceiling.
     # Formula: low score -> high strength, capped between 0.8 and 2.5.
-    strength = max(0.8, min(2.5, 120.0 / (score + 1)))
+    strength = max(MIN_SHARPEN_STRENGTH, min(MAX_SHARPEN_STRENGTH, SHARPEN_FACTOR / (score + 1)))
     gray = sharpen(gray, strength=strength)
 
     # ── CLAHE ─────────────────────────────────────────────────
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    gray = clahe.apply(gray)
+    gray = CLAHE.apply(gray)
 
     # ── Denoise ───────────────────────────────────────────────
     gray = cv2.fastNlMeansDenoising(gray, h=10)
@@ -85,34 +99,134 @@ def preprocess(frame: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
 
 
+def preprocess_tesseract(frame: np.ndarray) -> np.ndarray:
+    """
+    Tesseract-friendly preprocessing:
+    grayscale -> adaptive sharpen -> CLAHE -> denoise (no hard thresholding).
+    """
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    score = blur_score(gray)
+    if score < BLUR_WARN_SCORE:
+        print(f"  WARNING: Very blurry (score: {score:.1f}) — try moving slightly further back.")
+    elif score < BLUR_SOFT_SCORE:
+        print(f"  NOTE: Soft image (score: {score:.1f}) — sharpening applied.")
+    else:
+        print(f"  OK: Sharpness good (score: {score:.1f})")
+
+    strength = max(MIN_SHARPEN_STRENGTH, min(MAX_SHARPEN_STRENGTH, SHARPEN_FACTOR / (score + 1)))
+    gray = sharpen(gray, strength=strength)
+    gray = CLAHE.apply(gray)
+    gray = cv2.fastNlMeansDenoising(gray, h=10)
+    return gray
+
+
 def parse_results(results) -> list:
     """
     Normalise PaddleOCR output into a flat list of (box, text, confidence).
     Handles both the old list-of-lists format and the new Result object format.
     """
     lines = []
-    try:
-        # New API: results is a list of Result objects with a .boxes attribute
+    if not results:
+        return lines
+
+    first = results[0]
+    if hasattr(first, "boxes"):
+        # New API: results is a list of Result objects with a .boxes attribute.
         for res in results:
             for box_obj in res.boxes:
-                box  = box_obj.coordinate   # [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
+                box = box_obj.coordinate   # [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
                 text = box_obj.rec_text
-                conf = box_obj.rec_score
+                conf = float(box_obj.rec_score)
                 lines.append((box, text, conf))
-    except AttributeError:
-        # Old API: results[0] is a list of [box, (text, score)]
-        if results and results[0]:
-            for line in results[0]:
-                box, (text, conf) = line
-                lines.append((box, text, conf))
+        return lines
+
+    # Old API: results[0] is a list of [box, (text, score)]
+    if first:
+        for line in first:
+            box, (text, conf) = line
+            lines.append((box, text, float(conf)))
     return lines
 
 
-def draw_results(frame: np.ndarray, results) -> np.ndarray:
+def run_tesseract_ocr(image: np.ndarray) -> list:
+    """Run Tesseract OCR and return normalized (box, text, confidence[0..1])."""
+    data = pytesseract.image_to_data(
+        image,
+        config=f"--psm {TESSERACT_PSM}",
+        output_type=pytesseract.Output.DICT,
+    )
+
+    lines = []
+    total = len(data["text"])
+    for i in range(total):
+        text = data["text"][i].strip()
+        try:
+            conf_raw = float(data["conf"][i])
+        except ValueError:
+            continue
+        if not text or conf_raw < 0:
+            continue
+
+        x, y = data["left"][i], data["top"][i]
+        w, h = data["width"][i], data["height"][i]
+        box = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]]
+        lines.append((box, text, conf_raw / 100.0))
+    return lines
+
+
+def run_ocr(engine_name: str, ocr: PaddleOCR | None, image: np.ndarray) -> list:
+    """
+    Run OCR with cross-version compatibility.
+    Older APIs accept cls=True on ocr(); newer 3.x APIs may reject it.
+    """
+    if engine_name == "tesseract":
+        return run_tesseract_ocr(image)
+
+    if ocr is None:
+        return []
+
+    try:
+        results = ocr.ocr(image, cls=True)
+    except TypeError:
+        results = ocr.ocr(image)
+    return parse_results(results)
+
+
+def init_ocr_engine():
+    """
+    Pick and initialize OCR backend.
+    On aarch64 Raspberry Pi, Paddle may segfault at inference; auto mode
+    defaults to Tesseract for stability.
+    """
+    machine = platform.machine().lower()
+    requested = OCR_ENGINE.lower().strip()
+    use_tesseract = requested == "tesseract" or (requested == "auto" and "aarch64" in machine)
+
+    if use_tesseract:
+        version = pytesseract.get_tesseract_version()
+        print(f"Tesseract OCR v{version} ready (engine=tesseract).\n")
+        return "tesseract", None
+
+    print("Initialising PaddleOCR (first run downloads models ~60MB)...")
+    ocr_kwargs = {
+        "use_textline_orientation": True,
+        "lang": "en",
+    }
+    # PaddleOCR versions differ in accepted constructor args.
+    # Keep startup compatible across 2.x/3.x releases.
+    try:
+        ocr = PaddleOCR(show_log=False, **ocr_kwargs)
+    except (TypeError, ValueError):
+        ocr = PaddleOCR(**ocr_kwargs)
+    print("PaddleOCR ready (engine=paddle).\n")
+    return "paddle", ocr
+
+
+def draw_results(frame: np.ndarray, lines: list) -> np.ndarray:
     """Draw bounding boxes and text on the frame."""
     overlay = frame.copy()
 
-    for box, text, confidence in parse_results(results):
+    for box, text, confidence in lines:
         if confidence < CONFIDENCE_MIN:
             continue
 
@@ -131,13 +245,13 @@ def draw_results(frame: np.ndarray, results) -> np.ndarray:
     return overlay
 
 
-def print_results(results) -> None:
+def print_results(lines: list) -> None:
     """Print detected text to terminal."""
     print("\n" + "=" * 50)
     print("  DETECTED TEXT")
     print("=" * 50)
 
-    filtered = [(t, c) for _, t, c in parse_results(results) if c >= CONFIDENCE_MIN]
+    filtered = [(t, c) for _, t, c in lines if c >= CONFIDENCE_MIN]
 
     if not filtered:
         print("  No text detected.")
@@ -149,13 +263,7 @@ def print_results(results) -> None:
 
 
 def main():
-    print("Initialising PaddleOCR (first run downloads models ~60MB)...")
-    ocr = PaddleOCR(
-        use_textline_orientation=True,
-        lang='en',
-        show_log=False,
-    )
-    print("PaddleOCR ready.\n")
+    engine_name, ocr = init_ocr_engine()
 
     print("Starting camera...")
     cam = Picamera2()
@@ -164,7 +272,7 @@ def main():
     )
     cam.configure(config)
     cam.start()
-    time.sleep(1.5)  # let exposure settle
+    time.sleep(CAMERA_WARMUP_SEC)  # let exposure settle
     print("Camera ready.\n")
 
     print("Controls:")
@@ -175,6 +283,8 @@ def main():
 
     while True:
         frame = cam.capture_array()
+        if ROTATE_180:
+            frame = cv2.rotate(frame, cv2.ROTATE_180)
 
         if last_overlay is not None:
             show = cv2.resize(last_overlay, (PREVIEW_WIDTH, PREVIEW_HEIGHT))
@@ -194,14 +304,22 @@ def main():
             print("Scanning...")
             t0 = time.time()
 
-            processed = preprocess(frame)
-            results = ocr.ocr(processed, cls=True)
+            if engine_name == "tesseract":
+                processed = preprocess_tesseract(frame)
+            else:
+                processed = preprocess(frame)
+            lines = run_ocr(engine_name, ocr, processed)
 
             elapsed = time.time() - t0
-            print(f"Done in {elapsed:.2f}s")
+            print(f"Done in {elapsed:.2f}s ({len(lines)} candidates)")
 
-            last_overlay = draw_results(frame, results)
-            print_results(results)
+            if SAVE_DEBUG_IMAGES:
+                ts = int(time.time())
+                cv2.imwrite(f"ocr_raw_{ts}.jpg", frame)
+                cv2.imwrite(f"ocr_processed_{ts}.jpg", processed)
+
+            last_overlay = draw_results(frame, lines)
+            print_results(lines)
 
     cam.stop()
     cv2.destroyAllWindows()
