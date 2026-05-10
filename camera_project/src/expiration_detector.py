@@ -102,7 +102,7 @@ class ExpirationDetector:
             Datetime object or None
         """
         try:
-            parsed_date = dateparser.parse(date_string, dayfirst=False)
+            parsed_date = dateparser.parse(date_string, dayfirst=True)
             return parsed_date
 
         except Exception as e:
@@ -136,25 +136,40 @@ class ExpirationDetector:
             dates = self.extract_dates(text)
 
             # Parse and validate dates
+            now = datetime.now()
             parsed_dates = []
             for date_str in dates:
                 parsed = self.parse_date(date_str)
-                if parsed and parsed > datetime.now():
-                    parsed_dates.append({
-                        'raw': date_str,
-                        'parsed': parsed.isoformat(),
-                        'formatted': parsed.strftime('%Y-%m-%d')
-                    })
+                if parsed:
+                    # Keep dates within a reasonable range:
+                    # - Up to 2 years in the past (MFD dates)
+                    # - Up to 10 years in the future (expiry dates)
+                    years_diff = (parsed - now).days / 365.25
+                    if -2 <= years_diff <= 10:
+                        parsed_dates.append({
+                            'raw': date_str,
+                            'parsed': parsed.isoformat(),
+                            'formatted': parsed.strftime('%Y-%m-%d'),
+                            'is_future': parsed > now,
+                        })
 
             results['detected_dates'] = parsed_dates
 
-            # Set primary date (earliest future date or first found)
-            if parsed_dates:
-                results['primary_date'] = min(
-                    parsed_dates,
+            # Set primary date: prefer the latest future date (expiry)
+            future_dates = [d for d in parsed_dates if d.get('is_future')]
+            if future_dates:
+                results['primary_date'] = max(
+                    future_dates,
                     key=lambda x: x['parsed']
                 )
                 results['confidence'] = 0.9 if expiry_lines else 0.7
+            elif parsed_dates:
+                # No future dates found — use the latest date as fallback
+                results['primary_date'] = max(
+                    parsed_dates,
+                    key=lambda x: x['parsed']
+                )
+                results['confidence'] = 0.5  # Lower confidence for past dates
 
             logger.info(f"Detected expiration dates: {parsed_dates}")
             return results

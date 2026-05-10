@@ -489,11 +489,23 @@ def api_capture():
         ocr_result = ocr.extract_text(image_path)
 
         extracted_text = ""
+        ocr_meta = {}
         if ocr_result and ocr_result.get("status") == "success":
             extracted_text = ocr_result.get("full_text", "")
-            logger.info(f"[CAPTURE] OCR extracted {len(extracted_text)} chars")
+            ocr_meta = ocr_result.get("_meta", {})
+            logger.info(
+                "[CAPTURE] OCR text: %s",
+                extracted_text.replace('\n', ' ').strip()[:200] or "(empty)",
+            )
+            logger.info(
+                "[CAPTURE] OCR strategy=%s blur=%.1f roi=%s",
+                ocr_meta.get("strategy", "?"),
+                ocr_meta.get("blur_score", -1),
+                ocr_meta.get("roi", {}).get("source", "?"),
+            )
         else:
-            logger.warning("[CAPTURE] OCR failed or returned no text")
+            logger.warning("[CAPTURE] OCR failed or returned no text: %s",
+                           (ocr_result or {}).get("error", "unknown"))
 
         # 3. Detect expiration date
         detector = ExpirationDetector(cam_config)
@@ -506,7 +518,8 @@ def api_capture():
             confidence = detection.get("confidence", 0)
             logger.info(f"[CAPTURE] Expiry detected: {expiry_date} ({confidence:.0%})")
         else:
-            logger.warning("[CAPTURE] No expiration date detected")
+            logger.warning("[CAPTURE] No expiration date detected from text: %s",
+                           extracted_text.replace('\n', ' ').strip()[:100] or "(empty)")
 
         # 4. Copy image to uploads/ so the web UI can serve it
         dest_path = os.path.join(UPLOAD_FOLDER, image_filename)

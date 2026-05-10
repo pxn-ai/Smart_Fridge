@@ -347,9 +347,23 @@ async function doCapture() {
 
         const result = await res.json();
         appendLog(`Captured image: ${result.image_file}`);
-        appendLog(`OCR text: ${result.ocr_text ? result.ocr_text.replace(/\s+/g, ' ').trim().slice(0, 160) : 'No text detected'}`);
-        appendLog(result.expiry_detected ? `Detected expiry date: ${result.expiry_date}` : `Detected expiry date: fallback ${result.expiry_date}`, result.expiry_detected ? "info" : "warn");
-        appendLog(`Saved item #${result.item_id} with confidence ${(result.confidence * 100).toFixed(0)}%`);
+
+        // Show OCR text preview
+        const ocrPreview = result.ocr_text
+            ? result.ocr_text.replace(/\s+/g, ' ').trim().slice(0, 200)
+            : 'No text detected';
+        appendLog(`OCR text: ${ocrPreview}`);
+
+        // Show confidence
+        const confPct = (result.confidence * 100).toFixed(0);
+
+        if (result.expiry_detected) {
+            appendLog(`Detected expiry date: ${result.expiry_date} (${confPct}% confidence)`);
+        } else {
+            appendLog(`Detected expiry date: fallback ${result.expiry_date}`, "warn");
+        }
+
+        appendLog(`Saved item #${result.item_id} with confidence ${confPct}%`);
 
         showToast("✓ Item captured and added!");
         loadItems();

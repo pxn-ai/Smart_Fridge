@@ -4,11 +4,13 @@ Handles text extraction from images using Tesseract OCR.
 
 Improvements over v1:
 - Blur detection via Laplacian variance (skips/warns on shaky frames)
-- Three independent preprocessing strategies run in parallel;
-  the one with the highest Tesseract confidence wins
+- Five independent preprocessing strategies; the one with the highest
+  Tesseract confidence wins
 - Adaptive local-mean thresholding for uneven lighting / shadows
 - Proper unsharp-mask kernel instead of amplifying motion smear
-- Expanded PSM mode sweep (6, 4, 7, 11) per strategy
+- Expanded PSM mode sweep (6, 4, 11, 3) per strategy
+- Full-image fallback when guide-box crop yields nothing
+- Low-confidence date rescue for concatenated digit strings
 """
 
 import logging
@@ -41,12 +43,17 @@ logger = logging.getLogger(__name__)
 
 # ── Tuning knobs ──────────────────────────────────────────────────────────────
 BLUR_THRESHOLD   = 80.0   # Laplacian variance below this → warn & try harder
-UPSCALE_FACTOR   = 2      # Applied in strategies A and B
+UPSCALE_FACTOR   = 2      # Applied in strategies A and raw
+UPSCALE_FACTOR_B = 3      # Strategy B: adaptive threshold needs more detail
 UPSCALE_FACTOR_C = 3      # Strategy C uses a harder upscale for faded labels
-PSM_MODES        = [6, 11]  # Keep the OCR sweep small enough for the Pi
+PSM_MODES        = [4, 6, 11, 3]  # column, block, sparse, fully-auto
+ADAPTIVE_BLUR_RADIUS = 20  # BoxBlur radius for adaptive thresholding at 3x
+ADAPTIVE_C = 10            # Adaptive threshold offset constant
 DATE_REGEX = re.compile(
     r"\b(?:\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4}|\d{4}[\/\-.]\d{1,2}[\/\-.]\d{1,2})\b"
 )
+# Also match concatenated 8-digit dates like 22012027 → 22/01/2027
+DATE_CONCAT_REGEX = re.compile(r"\b(\d{8,10})\b")
 DATE_WHITELIST = "0123456789/.-: "
 
 
@@ -88,52 +95,100 @@ class OCREngine:
             return {"status": "error", "error": str(exc)}
 
         try:
+            # First attempt: guide-box crop (+ optional YOLO narrowing)
             ocr_input, roi_meta = self._detect_ocr_roi(image)
-            gray = ocr_input.convert("L")
-            blur_score = self._blur_score(gray)
-            is_blurry = blur_score < BLUR_THRESHOLD
-            if is_blurry:
-                logger.warning(
-                    "Image looks blurry (Laplacian var=%.1f < %.1f) — "
-                    "trying all deblur strategies",
-                    blur_score, BLUR_THRESHOLD,
-                )
-            else:
-                logger.debug("Blur score OK: %.1f", blur_score)
+            result = self._run_all_strategies(ocr_input, roi_meta)
 
-            candidates = self._build_candidates(image, gray, is_blurry)
-            best = self._best_result(candidates)
-            date_best = self._date_focused_result(ocr_input, blur_score)
+            # Fallback: if guide-box crop yielded no text, try the full image
+            if result is None or not result.get("text", "").strip():
+                logger.info("Guide-box crop yielded no text — retrying with full image")
+                full_result = self._run_all_strategies(image, {"source": "full_image", "box": None})
+                if full_result is not None and full_result.get("text", "").strip():
+                    result = full_result
+                    result["_meta"]["fallback"] = "full_image"
 
-            if self._is_better_date_candidate(date_best, best):
-                best = date_best
-
-            if best is None:
+            if result is None:
                 logger.warning("All OCR strategies returned empty text")
                 return {"status": "error", "error": "No text detected"}
 
+            # Post-process: try to rescue concatenated dates from the text
+            result["text"] = self._rescue_concatenated_dates(result["text"])
+
             logger.info(
                 "OCR done — strategy=%s psm=%s conf=%.0f%% chars=%d",
-                best["strategy"], best["psm"],
-                best["mean_conf"], len(best["text"]),
+                result["strategy"], result["psm"],
+                result["mean_conf"], len(result["text"]),
             )
             return {
-                "full_text": best["text"],
-                "confidence": best["raw_conf"],
-                "words": best["words"],
+                "full_text": result["text"],
+                "confidence": result["raw_conf"],
+                "words": result["words"],
                 "status": "success",
-                "_meta": {
-                    "strategy": best["strategy"],
-                    "psm": best["psm"],
-                    "mean_conf": best["mean_conf"],
-                    "blur_score": blur_score,
-                    "roi": roi_meta,
-                },
+                "_meta": result.get("_meta", {}),
             }
 
         except Exception as exc:
             logger.error("Error extracting text from %s: %s", image_path, exc)
             return {"status": "error", "error": str(exc)}
+
+    def _run_all_strategies(self, image, roi_meta):
+        """Run all preprocessing strategies + date focus on a given image."""
+        gray = image.convert("L")
+        blur_score = self._blur_score(gray)
+        is_blurry = blur_score < BLUR_THRESHOLD
+        if is_blurry:
+            logger.warning(
+                "Image looks blurry (Laplacian var=%.1f < %.1f) — "
+                "trying all deblur strategies",
+                blur_score, BLUR_THRESHOLD,
+            )
+        else:
+            logger.debug("Blur score OK: %.1f", blur_score)
+
+        candidates = self._build_candidates(image, gray, is_blurry)
+        best = self._best_result(candidates)
+        date_best = self._date_focused_result(image, blur_score)
+
+        if self._is_better_date_candidate(date_best, best):
+            best = date_best
+
+        if best is not None:
+            best["_meta"] = {
+                "strategy": best["strategy"],
+                "psm": best["psm"],
+                "mean_conf": best["mean_conf"],
+                "blur_score": blur_score,
+                "roi": roi_meta,
+            }
+        return best
+
+    def _rescue_concatenated_dates(self, text):
+        """
+        Tesseract sometimes returns dates without separators (e.g. '22012027'
+        instead of '22/01/2027'). Find 8-digit runs that look like dates and
+        insert separators so the downstream ExpirationDetector can parse them.
+        """
+        def _try_insert_separators(match):
+            digits = match.group(0)
+            if len(digits) == 8:
+                # Try DD/MM/YYYY
+                dd, mm, yyyy = digits[:2], digits[2:4], digits[4:]
+                if 1 <= int(dd) <= 31 and 1 <= int(mm) <= 12 and 2000 <= int(yyyy) <= 2099:
+                    return f"{dd}/{mm}/{yyyy}"
+                # Try YYYY/MM/DD
+                yyyy2, mm2, dd2 = digits[:4], digits[4:6], digits[6:]
+                if 2000 <= int(yyyy2) <= 2099 and 1 <= int(mm2) <= 12 and 1 <= int(dd2) <= 31:
+                    return f"{dd2}/{mm2}/{yyyy2}"
+            elif len(digits) == 9:
+                # Could be D/MM/YYYY with a leading confusion digit
+                # Try last 8
+                sub = digits[-8:]
+                dd, mm, yyyy = sub[:2], sub[2:4], sub[4:]
+                if 1 <= int(dd) <= 31 and 1 <= int(mm) <= 12 and 2000 <= int(yyyy) <= 2099:
+                    return digits[0] + f"{dd}/{mm}/{yyyy}"
+            return digits
+
+        return DATE_CONCAT_REGEX.sub(_try_insert_separators, text)
 
     def _init_date_detector(self):
         """Load optional YOLO model used to crop date-print region."""
@@ -166,12 +221,6 @@ class OCREngine:
         most likely date region inside that box. If not, the guide-box crop is
         still used so OCR ignores the rest of the frame.
         """
-        fallback_meta = {
-            "source": "guide_box",
-            "detector": self._date_detector_status,
-            "box": None,
-        }
-
         guided_image, guided_meta = self._guide_box_crop(image)
         if self._date_detector is None or not NUMPY_AVAILABLE:
             return guided_image, guided_meta
@@ -216,10 +265,12 @@ class OCREngine:
     def _guide_box_crop(self, image):
         """Crop the configured on-screen guide box from the full image."""
         width, height = image.size
-        box_w = max(1, int(width * float(getattr(self.config, "OCR_GUIDE_BOX_WIDTH_RATIO", 0.72))))
-        box_h = max(1, int(height * float(getattr(self.config, "OCR_GUIDE_BOX_HEIGHT_RATIO", 0.36))))
+        w_ratio = float(getattr(self.config, "OCR_GUIDE_BOX_WIDTH_RATIO", 0.92))
+        h_ratio = float(getattr(self.config, "OCR_GUIDE_BOX_HEIGHT_RATIO", 0.85))
+        box_w = max(1, int(width * w_ratio))
+        box_h = max(1, int(height * h_ratio))
         center_x = float(getattr(self.config, "OCR_GUIDE_BOX_CENTER_X", 0.50))
-        center_y = float(getattr(self.config, "OCR_GUIDE_BOX_CENTER_Y", 0.50))
+        center_y = float(getattr(self.config, "OCR_GUIDE_BOX_CENTER_Y", 0.48))
 
         center_px = int(width * center_x)
         center_py = int(height * center_y)
@@ -235,8 +286,8 @@ class OCREngine:
         meta = {
             "source": "guide_box",
             "box": [left, top, right, bottom],
-            "width_ratio": float(getattr(self.config, "OCR_GUIDE_BOX_WIDTH_RATIO", 0.72)),
-            "height_ratio": float(getattr(self.config, "OCR_GUIDE_BOX_HEIGHT_RATIO", 0.36)),
+            "width_ratio": w_ratio,
+            "height_ratio": h_ratio,
         }
         return crop, meta
 
@@ -280,11 +331,6 @@ class OCREngine:
         if NUMPY_AVAILABLE:
             arr = np.array(gray_image, dtype=np.float32)
             # Discrete 3×3 Laplacian
-            kernel = np.array([[0, 1, 0],
-                                [1, -4, 1],
-                                [0, 1, 0]], dtype=np.float32)
-            from numpy.lib.stride_tricks import as_strided
-            # Pad and convolve manually (scipy not guaranteed)
             padded = np.pad(arr, 1, mode="reflect")
             h, w = arr.shape
             lap = (
@@ -315,6 +361,8 @@ class OCREngine:
         Extra deblur strategies are added when the image is blurry.
         """
         candidates = [
+            ("B_adaptive",  self._strategy_adaptive(gray)),
+            ("E_raw",       self._strategy_raw(gray)),
             ("A_contrast",  self._strategy_contrast(gray)),
             ("C_binarize",  self._strategy_binarize(gray)),
         ]
@@ -322,40 +370,52 @@ class OCREngine:
             candidates.append(("D_deblur", self._strategy_deblur(gray)))
         return candidates
 
+    def _strategy_raw(self, gray):
+        """
+        Strategy E — minimal preprocessing.
+        Just upscale + gentle unsharp mask. No thresholding at all.
+        Works best for clearly printed labels with decent lighting.
+        """
+        img = gray.resize(
+            (gray.width * UPSCALE_FACTOR, gray.height * UPSCALE_FACTOR),
+            Image.LANCZOS,
+        )
+        img = img.filter(ImageFilter.UnsharpMask(radius=1.5, percent=100, threshold=2))
+        return img
+
     def _strategy_contrast(self, gray):
         """
-        Strategy A — improved version of the original pipeline.
-        autocontrast → upscale → unsharp mask (NOT raw sharpen) → mild contrast.
+        Strategy A — autocontrast + upscale + unsharp mask + mild contrast.
+        No MedianFilter (it smears thin text strokes at these sizes).
         """
         img = ImageOps.autocontrast(gray, cutoff=1)
         img = img.resize(
             (img.width * UPSCALE_FACTOR, img.height * UPSCALE_FACTOR),
             Image.LANCZOS,
         )
-        # Unsharp mask: (radius, percent, threshold)
-        # Much safer than Sharpness.enhance on blurry input.
         img = img.filter(ImageFilter.UnsharpMask(radius=1, percent=120, threshold=2))
         img = ImageEnhance.Contrast(img).enhance(1.5)
-        img = img.filter(ImageFilter.MedianFilter(size=3))
         return img
 
     def _strategy_adaptive(self, gray):
         """
         Strategy B — adaptive local-mean thresholding.
         Handles uneven lighting, shadows, and curved labels well.
+        This is the most effective strategy for product labels.
+        Uses BoxBlur for local mean at 3x upscale.
         """
-        img = gray.resize(
-            (gray.width * UPSCALE_FACTOR, gray.height * UPSCALE_FACTOR),
+        img = ImageOps.autocontrast(gray, cutoff=1)
+        img = img.resize(
+            (gray.width * UPSCALE_FACTOR_B, gray.height * UPSCALE_FACTOR_B),
             Image.LANCZOS,
         )
         if NUMPY_AVAILABLE:
             arr = np.array(img, dtype=np.float32)
-            # Local mean via a box blur (block size ~31px after upscale)
-            pil_blur = img.filter(ImageFilter.BoxBlur(15))
+            # Local mean via a box blur
+            pil_blur = img.filter(ImageFilter.BoxBlur(ADAPTIVE_BLUR_RADIUS))
             local_mean = np.array(pil_blur, dtype=np.float32)
             # Threshold: pixel > local_mean - C  →  white, else black
-            C = 8
-            binary = ((arr > local_mean - C) * 255).astype(np.uint8)
+            binary = ((arr > local_mean - ADAPTIVE_C) * 255).astype(np.uint8)
             img = Image.fromarray(binary, mode="L")
         else:
             # Fallback: autocontrast + hard binarize
@@ -385,9 +445,7 @@ class OCREngine:
         Strategy D — specifically for motion blur / camera shake.
         Applies a strong high-frequency boost before upscaling.
         """
-        # Gentle Gaussian blur to estimate the low-freq component
         low_freq = gray.filter(ImageFilter.GaussianBlur(radius=1))
-        # High-boost: original + k*(original - low_freq)
         if NUMPY_AVAILABLE:
             orig = np.array(gray, dtype=np.float32)
             lf   = np.array(low_freq, dtype=np.float32)
@@ -434,7 +492,7 @@ class OCREngine:
 
     def _run_tesseract(self, img, psm):
         """Run Tesseract on a preprocessed image with the given PSM mode."""
-        cfg = f"--oem 3 --psm {psm}"
+        cfg = f"--oem 1 --psm {psm}"
         return self._run_tesseract_with_config(img, cfg)
 
     def _run_tesseract_with_config(self, img, cfg):
@@ -449,19 +507,36 @@ class OCREngine:
         mean_conf = statistics.mean(confs) if confs else 0.0
         words = [w for w in data.get("text", []) if w and w.strip()]
 
+        # Extract PSM from config string for metadata
+        psm_match = re.search(r"--psm\s+(\d+)", cfg)
+        psm_val = int(psm_match.group(1)) if psm_match else -1
+
         return {
             "text": text,
             "raw_conf": data.get("conf", []),
             "words": words,
             "mean_conf": mean_conf,
-            "psm": psm,
+            "psm": psm_val,
         }
 
     def _normalize_text(self, text):
         return " ".join((text or "").split())
 
     def _contains_date_like_text(self, text):
-        return bool(DATE_REGEX.search(self._normalize_text(text)))
+        normalized = self._normalize_text(text)
+        if DATE_REGEX.search(normalized):
+            return True
+        # Also check for concatenated 8-digit dates
+        for match in DATE_CONCAT_REGEX.finditer(normalized):
+            digits = match.group(0)
+            if len(digits) == 8:
+                try:
+                    dd, mm, yyyy = int(digits[:2]), int(digits[2:4]), int(digits[4:])
+                    if 1 <= dd <= 31 and 1 <= mm <= 12 and 2000 <= yyyy <= 2099:
+                        return True
+                except ValueError:
+                    pass
+        return False
 
     def _is_better_date_candidate(self, date_candidate, general_candidate):
         if date_candidate is None:
@@ -491,11 +566,11 @@ class OCREngine:
         """
         processed = self._prep_date_crop(image)
         best = None
-        for psm in (7, 11):
+        for psm in (7, 11, 6, 4):
             try:
                 result = self._run_tesseract_with_config(
                     processed,
-                    f"--oem 3 --psm {psm} -c tessedit_char_whitelist={DATE_WHITELIST}",
+                    f"--oem 1 --psm {psm} -c tessedit_char_whitelist={DATE_WHITELIST}",
                 )
                 result["strategy"] = "date_focus"
                 result["text"] = result["text"].strip()
@@ -528,23 +603,34 @@ class OCREngine:
     def _best_result(self, candidates):
         """
         Run all strategy × PSM combinations.
-        Return the result with the highest mean Tesseract confidence
-        that also contains non-empty text.
+        Return the result with the highest score, boosted for date-like text.
         """
         best = None
+        best_score = -1.0
         for strategy_name, preprocessed in candidates:
             for psm in PSM_MODES:
                 try:
                     result = self._run_tesseract(preprocessed, psm)
                     result["strategy"] = strategy_name
-                    if not result["text"].strip():
+                    text = result["text"].strip()
+                    if not text:
                         continue
-                    result["text"] = result["text"].strip()
-                    if best is None or result["mean_conf"] > best["mean_conf"]:
+                    result["text"] = text
+
+                    # Score: mean confidence + bonus for date-like text
+                    score = result["mean_conf"]
+                    if self._contains_date_like_text(text):
+                        score += 30.0  # Strongly prefer results with dates
+                    # Bonus for having substantial text (not just noise)
+                    word_count = len([w for w in result["words"] if len(w) >= 2])
+                    score += min(word_count * 2.0, 20.0)
+
+                    if score > best_score:
+                        best_score = score
                         best = result
                         logger.debug(
-                            "New best: strategy=%s psm=%d conf=%.1f",
-                            strategy_name, psm, result["mean_conf"],
+                            "New best: strategy=%s psm=%d conf=%.1f score=%.1f words=%d",
+                            strategy_name, psm, result["mean_conf"], score, word_count,
                         )
                 except Exception as exc:
                     logger.debug(
