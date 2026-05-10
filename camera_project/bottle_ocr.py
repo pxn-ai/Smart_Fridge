@@ -51,25 +51,41 @@ def preprocess(frame: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
 
 
-def draw_results(frame: np.ndarray, results: list) -> np.ndarray:
+def parse_results(results) -> list:
+    """
+    Normalise PaddleOCR output into a flat list of (box, text, confidence).
+    Handles both the old list-of-lists format and the new Result object format.
+    """
+    lines = []
+    try:
+        # New API: results is a list of Result objects with a .boxes attribute
+        for res in results:
+            for box_obj in res.boxes:
+                box  = box_obj.coordinate   # [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
+                text = box_obj.rec_text
+                conf = box_obj.rec_score
+                lines.append((box, text, conf))
+    except AttributeError:
+        # Old API: results[0] is a list of [box, (text, score)]
+        if results and results[0]:
+            for line in results[0]:
+                box, (text, conf) = line
+                lines.append((box, text, conf))
+    return lines
+
+
+def draw_results(frame: np.ndarray, results) -> np.ndarray:
     """Draw bounding boxes and text on the frame."""
     overlay = frame.copy()
 
-    if not results or not results[0]:
-        return overlay
-
-    for line in results[0]:
-        box, (text, confidence) = line
-
+    for box, text, confidence in parse_results(results):
         if confidence < CONFIDENCE_MIN:
             continue
 
-        # Draw bounding box
         pts = np.array(box, dtype=np.int32)
         cv2.polylines(overlay, [pts], isClosed=True,
                       color=(0, 255, 0), thickness=2)
 
-        # Label background
         x, y = int(box[0][0]), int(box[0][1]) - 8
         label = f"{text}  ({confidence:.0%})"
         (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
@@ -81,19 +97,19 @@ def draw_results(frame: np.ndarray, results: list) -> np.ndarray:
     return overlay
 
 
-def print_results(results: list):
+def print_results(results) -> None:
     """Print detected text to terminal."""
     print("\n" + "═" * 50)
     print("  DETECTED TEXT")
     print("═" * 50)
 
-    if not results or not results[0]:
+    filtered = [(t, c) for _, t, c in parse_results(results) if c >= CONFIDENCE_MIN]
+
+    if not filtered:
         print("  No text detected.")
     else:
-        for line in results[0]:
-            _, (text, confidence) = line
-            if confidence >= CONFIDENCE_MIN:
-                print(f"  {text:<35} ({confidence:.0%})")
+        for text, confidence in filtered:
+            print(f"  {text:<35} ({confidence:.0%})")
 
     print("═" * 50 + "\n")
 
@@ -101,9 +117,8 @@ def print_results(results: list):
 def main():
     print("Initialising PaddleOCR (first run downloads models ~60MB)...")
     ocr = PaddleOCR(
-        use_angle_cls=True,   # handles rotated text on labels
+        use_textline_orientation=True,  # replaces deprecated use_angle_cls
         lang='en',
-        use_gpu=False,        # Pi 5 has no compatible GPU
         show_log=False,
     )
     print("PaddleOCR ready.\n")
