@@ -13,6 +13,7 @@ Improvements over v1:
 
 import logging
 import os
+import re
 import statistics
 from pathlib import Path
 
@@ -42,7 +43,11 @@ logger = logging.getLogger(__name__)
 BLUR_THRESHOLD   = 80.0   # Laplacian variance below this → warn & try harder
 UPSCALE_FACTOR   = 2      # Applied in strategies A and B
 UPSCALE_FACTOR_C = 3      # Strategy C uses a harder upscale for faded labels
-PSM_MODES        = [6, 4, 7, 11]  # Page-segmentation modes to try per strategy
+PSM_MODES        = [6, 11]  # Keep the OCR sweep small enough for the Pi
+DATE_REGEX = re.compile(
+    r"\b(?:\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4}|\d{4}[\/\-.]\d{1,2}[\/\-.]\d{1,2})\b"
+)
+DATE_WHITELIST = "0123456789/.-: "
 
 
 class OCREngine:
@@ -83,7 +88,7 @@ class OCREngine:
             return {"status": "error", "error": str(exc)}
 
         try:
-            ocr_input, roi_meta = self._detect_date_roi(image)
+            ocr_input, roi_meta = self._detect_ocr_roi(image)
             gray = ocr_input.convert("L")
             blur_score = self._blur_score(gray)
             is_blurry = blur_score < BLUR_THRESHOLD
@@ -98,6 +103,10 @@ class OCREngine:
 
             candidates = self._build_candidates(image, gray, is_blurry)
             best = self._best_result(candidates)
+            date_best = self._date_focused_result(ocr_input, blur_score)
+
+            if self._is_better_date_candidate(date_best, best):
+                best = date_best
 
             if best is None:
                 logger.warning("All OCR strategies returned empty text")
@@ -149,25 +158,30 @@ class OCREngine:
             self._date_detector_status = f"disabled:model-load-error:{exc}"
             logger.warning("Failed to load YOLO date detector: %s", exc)
 
-    def _detect_date_roi(self, image):
+    def _detect_ocr_roi(self, image):
         """
-        Return ROI image focused on date region if YOLO is available.
-        Falls back to original image when no reliable detection exists.
+        Return a crop focused on the guide-box region.
+
+        If a YOLO detector is available, it can further narrow the crop to the
+        most likely date region inside that box. If not, the guide-box crop is
+        still used so OCR ignores the rest of the frame.
         """
         fallback_meta = {
-            "source": "full_image",
+            "source": "guide_box",
             "detector": self._date_detector_status,
             "box": None,
         }
+
+        guided_image, guided_meta = self._guide_box_crop(image)
         if self._date_detector is None or not NUMPY_AVAILABLE:
-            return image, fallback_meta
+            return guided_image, guided_meta
 
         try:
-            arr = np.array(image.convert("RGB"))
+            arr = np.array(guided_image.convert("RGB"))
             conf_th = float(getattr(self.config, "YOLO_DATE_DETECT_CONFIDENCE", 0.30))
             preds = self._date_detector.predict(arr, conf=conf_th, verbose=False)
             if not preds or len(preds[0].boxes) == 0:
-                return image, fallback_meta
+                return guided_image, guided_meta
 
             boxes = preds[0].boxes.xyxy.cpu().numpy()
             confs = preds[0].boxes.conf.cpu().numpy()
@@ -179,17 +193,17 @@ class OCREngine:
             height = max(1.0, y2 - y1)
             px = int(width * pad_ratio)
             py = int(height * pad_ratio)
-            img_w, img_h = image.size
+            img_w, img_h = guided_image.size
             x1 = max(0, int(x1) - px)
             y1 = max(0, int(y1) - py)
             x2 = min(img_w, int(x2) + px)
             y2 = min(img_h, int(y2) + py)
             if x2 <= x1 or y2 <= y1:
-                return image, fallback_meta
+                return guided_image, guided_meta
 
-            crop = image.crop((x1, y1, x2, y2))
+            crop = guided_image.crop((x1, y1, x2, y2))
             meta = {
-                "source": "yolo_date_region",
+                "source": "guide_box+yolo_date_region",
                 "detector": self._date_detector_status,
                 "box": [x1, y1, x2, y2],
                 "confidence": float(confs[best_idx]),
@@ -197,7 +211,34 @@ class OCREngine:
             return crop, meta
         except Exception as exc:
             logger.debug("YOLO ROI detection failed: %s", exc)
-            return image, fallback_meta
+            return guided_image, guided_meta
+
+    def _guide_box_crop(self, image):
+        """Crop the configured on-screen guide box from the full image."""
+        width, height = image.size
+        box_w = max(1, int(width * float(getattr(self.config, "OCR_GUIDE_BOX_WIDTH_RATIO", 0.72))))
+        box_h = max(1, int(height * float(getattr(self.config, "OCR_GUIDE_BOX_HEIGHT_RATIO", 0.36))))
+        center_x = float(getattr(self.config, "OCR_GUIDE_BOX_CENTER_X", 0.50))
+        center_y = float(getattr(self.config, "OCR_GUIDE_BOX_CENTER_Y", 0.50))
+
+        center_px = int(width * center_x)
+        center_py = int(height * center_y)
+        left = max(0, center_px - (box_w // 2))
+        top = max(0, center_py - (box_h // 2))
+        right = min(width, left + box_w)
+        bottom = min(height, top + box_h)
+
+        if right - left < 4 or bottom - top < 4:
+            return image, {"source": "full_image", "box": None}
+
+        crop = image.crop((left, top, right, bottom))
+        meta = {
+            "source": "guide_box",
+            "box": [left, top, right, bottom],
+            "width_ratio": float(getattr(self.config, "OCR_GUIDE_BOX_WIDTH_RATIO", 0.72)),
+            "height_ratio": float(getattr(self.config, "OCR_GUIDE_BOX_HEIGHT_RATIO", 0.36)),
+        }
+        return crop, meta
 
     def extract_regions(self, image_path, regions=None):
         """
@@ -275,7 +316,6 @@ class OCREngine:
         """
         candidates = [
             ("A_contrast",  self._strategy_contrast(gray)),
-            ("B_adaptive",  self._strategy_adaptive(gray)),
             ("C_binarize",  self._strategy_binarize(gray)),
         ]
         if is_blurry:
@@ -395,6 +435,10 @@ class OCREngine:
     def _run_tesseract(self, img, psm):
         """Run Tesseract on a preprocessed image with the given PSM mode."""
         cfg = f"--oem 3 --psm {psm}"
+        return self._run_tesseract_with_config(img, cfg)
+
+    def _run_tesseract_with_config(self, img, cfg):
+        """Run Tesseract with an explicit config string."""
         lang = self.config.OCR_LANGUAGE
 
         text = pytesseract.image_to_string(img, lang=lang, config=cfg)
@@ -413,6 +457,74 @@ class OCREngine:
             "psm": psm,
         }
 
+    def _normalize_text(self, text):
+        return " ".join((text or "").split())
+
+    def _contains_date_like_text(self, text):
+        return bool(DATE_REGEX.search(self._normalize_text(text)))
+
+    def _is_better_date_candidate(self, date_candidate, general_candidate):
+        if date_candidate is None:
+            return False
+        if general_candidate is None:
+            return True
+
+        date_text = self._normalize_text(date_candidate.get("text", ""))
+        general_text = self._normalize_text(general_candidate.get("text", ""))
+        date_has_date = self._contains_date_like_text(date_text)
+        general_has_date = self._contains_date_like_text(general_text)
+
+        if date_has_date and not general_has_date:
+            return True
+        if date_has_date and general_has_date:
+            return date_candidate.get("mean_conf", 0.0) >= general_candidate.get("mean_conf", 0.0)
+        if date_candidate.get("mean_conf", 0.0) >= (general_candidate.get("mean_conf", 0.0) + 10.0):
+            return True
+        return False
+
+    def _date_focused_result(self, image, blur_score):
+        """
+        Try a single date-focused pass with a digit/date whitelist.
+
+        This fallback is aimed at expiry labels where the general OCR pass
+        returns noisy text but the date is still visible in a smaller region.
+        """
+        processed = self._prep_date_crop(image)
+        best = None
+        for psm in (7, 11):
+            try:
+                result = self._run_tesseract_with_config(
+                    processed,
+                    f"--oem 3 --psm {psm} -c tessedit_char_whitelist={DATE_WHITELIST}",
+                )
+                result["strategy"] = "date_focus"
+                result["text"] = result["text"].strip()
+                if not result["text"]:
+                    continue
+
+                score = result["mean_conf"]
+                if self._contains_date_like_text(result["text"]):
+                    score += 50.0
+                if blur_score < BLUR_THRESHOLD:
+                    score += 5.0
+                result["score"] = score
+
+                if best is None or result["score"] > best["score"]:
+                    best = result
+            except Exception as exc:
+                logger.debug("date focus psm=%d failed: %s", psm, exc)
+
+        return best
+
+    def _prep_date_crop(self, image):
+        """Lightweight preprocessing tuned for small printed expiry dates."""
+        gray = image.convert("L")
+        gray = ImageOps.autocontrast(gray, cutoff=1)
+        gray = gray.resize((gray.width * 3, gray.height * 3), Image.LANCZOS)
+        gray = gray.filter(ImageFilter.UnsharpMask(radius=1, percent=180, threshold=2))
+        gray = ImageEnhance.Contrast(gray).enhance(1.8)
+        return gray
+
     def _best_result(self, candidates):
         """
         Run all strategy × PSM combinations.
@@ -427,6 +539,7 @@ class OCREngine:
                     result["strategy"] = strategy_name
                     if not result["text"].strip():
                         continue
+                    result["text"] = result["text"].strip()
                     if best is None or result["mean_conf"] > best["mean_conf"]:
                         best = result
                         logger.debug(

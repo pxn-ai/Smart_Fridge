@@ -6,6 +6,7 @@ Captures photos triggered by button press with live preview
 import logging
 import os
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -60,6 +61,7 @@ class CameraCapture:
             )
             self.camera.configure(config)
             self.camera.start()
+            self._apply_camera_tuning()
             logger.info("Camera initialized successfully")
             logger.info(f"Resolution: {self.config.CAMERA_RESOLUTION}")
 
@@ -96,6 +98,7 @@ class CameraCapture:
         try:
             with self._camera_lock:
                 array = self.camera.capture_array("main")
+                array = self._apply_orientation(array)
                 self.last_frame = array
                 return array
 
@@ -111,9 +114,9 @@ class CameraCapture:
         try:
             with self._camera_lock:
                 try:
-                    return self.camera.capture_array("lores")
+                    return self._apply_orientation(self.camera.capture_array("lores"))
                 except Exception:
-                    return self.camera.capture_array("main")
+                    return self._apply_orientation(self.camera.capture_array("main"))
         except Exception as e:
             logger.error(f"Error getting preview frame: {e}")
             return None
@@ -160,11 +163,8 @@ class CameraCapture:
 
                 # Save directly from the camera when OpenCV is not installed.
                 if OPENCV_AVAILABLE:
-                    if self.last_frame is not None:
-                        frame = self.last_frame
-                    else:
-                        frame = self.camera.capture_array("main")
-
+                    frame = self._capture_sharpest_frame()
+                    frame = self._apply_orientation(frame)
                     cv2.imwrite(filepath, frame)
                 else:
                     self.camera.capture_file(filepath)
@@ -175,6 +175,83 @@ class CameraCapture:
         except Exception as e:
             logger.error(f"Error capturing photo: {e}")
             return None
+
+    def _capture_sharpest_frame(self, attempts=3, delay=0.05):
+        """Capture a short burst and return the sharpest frame."""
+        best_frame = None
+        best_score = -1.0
+
+        for _ in range(max(1, attempts)):
+            frame = self.camera.capture_array("main")
+            score = self._sharpness_score(frame)
+            if score > best_score:
+                best_score = score
+                best_frame = frame
+            if delay:
+                time.sleep(delay)
+
+        if best_frame is not None:
+            logger.info("Selected sharpest capture frame (score=%.1f)", best_score)
+            self.last_frame = best_frame
+            return best_frame
+
+        return self.camera.capture_array("main")
+
+    def _apply_orientation(self, frame):
+        """Rotate and flip frames according to the configured camera mount."""
+        if frame is None:
+            return None
+
+        rotated = frame
+        rotation = int(getattr(self.config, "CAMERA_ROTATION", 0) or 0)
+        if rotation == 90:
+            rotated = cv2.rotate(rotated, cv2.ROTATE_90_CLOCKWISE)
+        elif rotation == 180:
+            rotated = cv2.rotate(rotated, cv2.ROTATE_180)
+        elif rotation == 270:
+            rotated = cv2.rotate(rotated, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+        if bool(getattr(self.config, "CAMERA_FLIP_HORIZONTAL", False)):
+            rotated = cv2.flip(rotated, 1)
+        if bool(getattr(self.config, "CAMERA_FLIP_VERTICAL", False)):
+            rotated = cv2.flip(rotated, 0)
+
+        return rotated
+
+    def _apply_camera_tuning(self):
+        """Bias the sensor toward short, sharp captures for OCR."""
+        if not self.camera:
+            return
+
+        controls_to_set = {
+            "AeEnable": bool(getattr(self.config, "CAMERA_AE_ENABLE", True)),
+            "AeMeteringMode": int(getattr(self.config, "CAMERA_AE_METERING_MODE", 2)),
+            "AeExposureMode": int(getattr(self.config, "CAMERA_AE_EXPOSURE_MODE", 0)),
+            "AwbEnable": bool(getattr(self.config, "CAMERA_AWB_ENABLE", True)),
+            "ExposureTime": int(getattr(self.config, "CAMERA_EXPOSURE_TIME", 10000)),
+            "AnalogueGain": float(getattr(self.config, "CAMERA_ANALOGUE_GAIN", 1.8)),
+            "FrameDurationLimits": (
+                int(getattr(self.config, "CAMERA_FRAME_DURATION_MIN", 10000)),
+                int(getattr(self.config, "CAMERA_FRAME_DURATION_MAX", 16666)),
+            ),
+        }
+
+        try:
+            self.camera.set_controls(controls_to_set)
+            logger.info("Applied OCR-oriented camera tuning")
+        except Exception as exc:
+            logger.warning("Could not apply camera tuning: %s", exc)
+
+    def _sharpness_score(self, frame):
+        """Estimate focus quality with Laplacian variance when OpenCV is available."""
+        if not OPENCV_AVAILABLE:
+            return 0.0
+
+        try:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        except Exception:
+            return 0.0
 
     def _simulate_capture(self):
         """Simulate a photo capture (for testing without camera)"""

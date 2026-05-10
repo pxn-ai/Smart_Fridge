@@ -79,6 +79,12 @@ body{font-family:var(--font);background:var(--bg);color:var(--text);min-height:1
 .preview-badge{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border-radius:999px;background:rgba(0,206,201,.12);border:1px solid rgba(0,206,201,.25);color:var(--green);font-size:.78rem;font-weight:600;white-space:nowrap}
 .preview-frame{position:relative;overflow:hidden;border-radius:calc(var(--radius) - 2px);background:#05070d;border:1px solid var(--border);aspect-ratio:4 / 3;min-height:280px}
 .preview-frame img{width:100%;height:100%;object-fit:contain;display:block}
+.preview-guide{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none;z-index:2}
+.preview-guide-box{position:absolute;width:min(72%, 520px);height:min(36%, 230px);border:2px solid rgba(0,206,201,.82);border-radius:18px;box-shadow:0 0 0 999px rgba(5,7,13,.12), inset 0 0 0 1px rgba(255,255,255,.08)}
+.preview-guide-box::before,.preview-guide-box::after{content:"";position:absolute;inset:auto;border:2px solid rgba(0,206,201,.7);width:18px;height:18px}
+.preview-guide-box::before{top:-2px;left:-2px;border-right:none;border-bottom:none}
+.preview-guide-box::after{right:-2px;bottom:-2px;border-left:none;border-top:none}
+.preview-guide-label{position:absolute;bottom:18px;left:50%;transform:translateX(-50%);padding:7px 12px;border-radius:999px;background:rgba(15,17,23,.82);border:1px solid rgba(0,206,201,.22);color:var(--green);font-size:.76rem;font-weight:700;letter-spacing:.04em;text-transform:uppercase;backdrop-filter:blur(8px)}
 
 /* ── Capture Log ─────────────────────────────────── */
 .log-card{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:18px;box-shadow:var(--shadow)}
